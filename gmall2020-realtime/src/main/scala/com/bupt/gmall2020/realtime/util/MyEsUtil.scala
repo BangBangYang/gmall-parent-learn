@@ -31,13 +31,14 @@ object MyEsUtil {
       .connTimeout(10000).readTimeout(10000).build())
 
   }
-  def bulkDoc(sourceList:List[Any],indexName:String): Unit ={
+  //在处理完成对redis自动提交offset后，es利用id 进行幂等处理（因为假如sparkStreaming在处理过程中崩溃了，在启动可能会存在重复数据问题）
+  def bulkDoc(sourceList:List[(String,Any)],indexName:String): Unit ={
     if(sourceList.size ==0 || sourceList == null)
       return
     val jest: JestClient = getClient
     val bulkBuilder: Bulk.Builder = new Bulk.Builder
-    for(source <- sourceList){
-        val index: Index = new Index.Builder(source).index(indexName).`type`("_doc").build()
+    for((id,source) <- sourceList){
+        val index: Index = new Index.Builder(source).index(indexName).`type`("_doc").id(id).build()
       bulkBuilder.addAction(index)
     }
     val bulk: Bulk = bulkBuilder.build()

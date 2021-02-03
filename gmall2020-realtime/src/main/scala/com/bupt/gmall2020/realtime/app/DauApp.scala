@@ -5,10 +5,12 @@ import java.text.SimpleDateFormat
 
 import com.alibaba.fastjson.{JSON, JSONObject}
 import com.bupt.gmall2020.realtime.bean.DauInfo
-import com.bupt.gmall2020.realtime.util.{MyEsUtil, MyKafkaUtil, RedisUtil}
+import com.bupt.gmall2020.realtime.util.{MyEsUtil, MyKafkaUtil, OffsetManger, RedisUtil}
 import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.kafka.common.TopicPartition
 import org.apache.spark.SparkConf
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
+import org.apache.spark.streaming.kafka010.{HasOffsetRanges, OffsetRange}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 import redis.clients.jedis.Jedis
 
@@ -21,15 +23,29 @@ import scala.collection.mutable.ListBuffer
  */
 object DauApp {
   def main(args: Array[String]): Unit = {
-    val sparkConf: SparkConf = new SparkConf().setMaster("local[4]").setAppName("app")
+    val sparkConf: SparkConf = new SparkConf().setMaster("local[2]").setAppName("app")
     val ssc: StreamingContext = new StreamingContext(sparkConf, Seconds(5))
     val topic = "GMALL_STARTUP"
     val groupId = "DAU_GROUP"
-    val recordInputDStream: InputDStream[ConsumerRecord[String, String]] = MyKafkaUtil.getKafkaStream(topic, ssc)
+    var recordInputDStream: InputDStream[ConsumerRecord[String, String]] = null
+    val offsetMap: Map[TopicPartition, Long] = OffsetManger.getOffset(topic,groupId)
+    if(offsetMap != null && offsetMap.size >0){
+      recordInputDStream = MyKafkaUtil.getKafkaStream(topic, ssc,offsetMap,groupId)
+    }else{
+      recordInputDStream = MyKafkaUtil.getKafkaStream(topic, ssc)
+    }
+
+    //得到本批次的偏移量的结束位置，用于更新redis中的偏移量
+    var  offsetRanges: Array[OffsetRange] = Array.empty[OffsetRange]
+    val  inputGetOffsetDstream: DStream[ConsumerRecord[String, String]] =recordInputDStream.transform { rdd =>
+//      println(rdd.getClass.getSimpleName)
+      offsetRanges = rdd.asInstanceOf[HasOffsetRanges].offsetRanges  //driver? executor?  //周期性的执行
+      rdd
+    }
 
 //    recordInputDStream.map(_.value()).print()
 
-    val jsonObjDstream: DStream[JSONObject] = recordInputDStream.map { record =>
+    val jsonObjDstream: DStream[JSONObject] = inputGetOffsetDstream.map { record =>
       val jsonString: String = record.value()
       val jsonObj: JSONObject = JSON.parseObject(jsonString)
       val ts:java.lang.Long = jsonObj.getLong("ts")
@@ -77,14 +93,15 @@ object DauApp {
         }
       }
       jedis.close()
-      // println("过滤后："+filteredList.size)
+       println("过滤后："+filteredList.size)
       filteredList.toIterator
     }
 //    filteredDstream.print(10)
     filteredDstream.foreachRDD { rdd =>
+//      println(rdd.getClass.getSimpleName)
       rdd.foreachPartition{jsonItr=>
        val list: List[JSONObject] = jsonItr.toList
-        val dauList: List[DauInfo] = list.map { jsonObj =>
+        val dauList: List[(String,DauInfo)] = list.map { jsonObj =>
           val commonJSONObj: JSONObject = jsonObj.getJSONObject("common")
           val dauInfo = DauInfo(commonJSONObj.getString("mid"),
             commonJSONObj.getString("uid"),
@@ -96,12 +113,13 @@ object DauApp {
             "00",
             jsonObj.getLong("ts")
           )
-          dauInfo
+          (dauInfo.mid,dauInfo)
         }
         val dt: String = new SimpleDateFormat("yyyy-MM-dd").format(new Date())
         MyEsUtil.bulkDoc(dauList,"gmall_dau_info_"+dt)
 
       }
+      OffsetManger.setOffset(topic,groupId,offsetRanges)
     }
     ssc.start()
     ssc.awaitTermination()
